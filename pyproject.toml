@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proshop-scanner"
+version = "0.1.0"
+description = "Proshop Poland electronics price scanner"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "beautifulsoup4>=4.12,<5.0",
+    "curl-cffi>=0.13,<1.0",
+    "lxml>=5.0",
+    "pydantic>=2.0,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "structlog>=24.4,<26.0",
+    "deal-pipeline @ git+https://github.com/krudzki/deal-pipeline.git",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9.0", "pytest-asyncio>=0.24,<1.0", "ruff>=0.6,<1.0"]
+
+[project.scripts]
+proshop-scanner = "proshop.scanner:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["proshop"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
