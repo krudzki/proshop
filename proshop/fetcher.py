@@ -26,9 +26,12 @@ class CurlCffiFetcher:
         self._delay = max(0.0, delay_s)
         self._sleep = sleeper
         self._timeout = timeout_s
-        self._session = session or requests.Session(impersonate="chrome131")
+        self._session = session or self._new_session()
         self._first = True
         self.shop_refusal = False
+
+    def _new_session(self):
+        return requests.Session(impersonate="chrome131", trust_env=True)
 
     async def __call__(self, url: str) -> tuple[int, str]:
         if self.shop_refusal:
@@ -44,6 +47,7 @@ class CurlCffiFetcher:
                     timeout=self._timeout,
                     allow_redirects=True,
                 )
+
             except Exception:
                 if attempt < 2:
                     continue

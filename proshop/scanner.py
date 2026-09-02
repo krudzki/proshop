@@ -75,7 +75,8 @@ class ScanResult:
     increased: int = 0
     drops: int = 0
     from_ledger: int = 0
-    from_previous: int = 0
+    from_tile: int = 0
+    without_reference: int = 0
     with_code: int = 0
     focus_pages: int = 0
     qualified: int = 0
@@ -374,28 +375,57 @@ async def run(
                 reference_price = None
                 reference_kind = ""
                 conditions: list[str] = []
+                ledger_reference: float | None = None
+                ledger_kind = ""
+                ledger_condition = ""
                 if reference and reference.price > product.price:
-                    reference_price = reference.price
-                    reference_kind = reference.basis
-                    outcome.from_ledger += 1
-                    age = f", {reference.age_hours:.0f}h old" if reference.age_hours >= 1 else ""
-                    conditions.append(
-                        f"reference: {reference.seller} {reference.price:.2f} PLN ({reference.condition}{age})"
+                    ledger_reference = reference.price
+                    ledger_kind = reference.basis
+                    ledger_condition = (
+                        f"reference: {reference.seller} {reference.price:.2f} PLN"
+                        f" ({reference.condition}"
+                        + (f", {reference.age_hours:.0f}h old" if reference.age_hours >= 1 else "")
+                        + ")"
                     )
-                elif previous is None:
-                    outcome.first_seen += 1
-                    continue
-                elif product.price > previous + 0.01:
-                    outcome.increased += 1
-                    continue
-                elif product.price >= previous - 0.01:
-                    outcome.unchanged += 1
-                    continue
+                # Tile original_price (rendered .presales-price) is the
+                # only market reference available for a first sighting. A price
+                # that is not materially below either the ledger or the tile is
+                # scored as  rather than as ;
+                # the bucket exists for "nothing to compare against", not for
+                # "compared and not worth reporting".
+                tile_reference: float | None = (
+                    product.original_price
+                    if product.original_price and product.original_price > product.price
+                    else None
+                )
+                candidates: list[tuple[float, str, str]] = []
+                if ledger_reference is not None:
+                    candidates.append((ledger_reference, ledger_kind, ledger_condition))
+                if tile_reference is not None:
+                    candidates.append((tile_reference, "tile-original-price", "reference: tile original price"))
+                if candidates:
+                    reference_price, reference_kind, cond = min(candidates, key=lambda c: c[0])
+                    conditions.append(cond)
+                    if reference_kind.startswith("ledger") or reference_kind in ("code", "ledger-code"):
+                        outcome.from_ledger += 1
+                    elif reference_kind == "tile-original-price":
+                        outcome.from_tile += 1
                 else:
-                    reference_price = previous
-                    reference_kind = "previous_observation"
-                    outcome.from_previous += 1
-                    conditions.append("reference: previous Proshop observation")
+                    if previous is None:
+                        outcome.without_reference = getattr(outcome, "without_reference", 0) + 1  # type: ignore[attr-defined]
+                    elif product.price > previous + 0.01:
+                        outcome.increased += 1
+                    elif product.price >= previous - 0.01:
+                        outcome.unchanged += 1
+                    else:
+                        # No market price exists, so scoring against our own
+                        # past observation is not a price drop to report. The
+                        # Morele outlet ran for weeks as  while the
+                        # listing held real deals precisely because this
+                        # fallback treated "changed vs self" as "good vs
+                        # market".
+                        outcome.without_reference = getattr(outcome, "without_reference", 0) + 1  # type: ignore[attr-defined]
+                    continue
 
                 outcome.drops += 1
                 event_key = f"{observation_key}:{int(round(product.price * 100))}"
