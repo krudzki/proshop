@@ -442,6 +442,7 @@ async def run(
                     product_identity_key=ledger_key,
                     reference_kind=reference_kind,
                     category=canonical,
+                    condition="new",
                 )
                 reason = report_reason(deal)
                 if not reason:
