@@ -95,6 +95,12 @@ def test_demo_product_is_a_separate_condition_bucket():
     assert demo.mpn == "PB7L0086SE"
 
 
+def test_incoming_stock_form_is_preorder_not_purchasable():
+    incoming = parse_listing(_fixture(), "https://www.proshop.pl/RAM")[1]
+
+    assert incoming.purchasable is False
+
+
 def test_normal_price_is_parsed_but_not_exposed_as_reference_evidence():
     gpu = parse_listing(_fixture(), "https://www.proshop.pl/RAM")[0]
     assert gpu.original_price == 3999.00

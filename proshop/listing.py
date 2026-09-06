@@ -134,7 +134,13 @@ def parse_listing(html: str, page_url: str = "") -> list[ListingProduct]:
         image = link.select_one("img") if link else None
         original_node = card.select_one(".presales-price")
         original = parse_amount(original_node.get_text(" ", strip=True)) if original_node else None
-        purchasable = card.select_one('form[action="/Basket/AddItem"]') is not None
+        # Proshop renders an add-to-basket form for incoming/preorder stock too.
+        # Such a price cannot be bought from current stock and must not become a
+        # cross-shop reference merely because the site accepts an advance order.
+        purchasable = (
+            card.select_one('form[action="/Basket/AddItem"]') is not None
+            and card.select_one(".site-icon-stock-comming") is None
+        )
         is_outlet = product_id.lower().endswith("d") or "*demo*" in name.lower()
         products.append(
             ListingProduct(
