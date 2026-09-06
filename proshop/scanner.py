@@ -464,7 +464,12 @@ async def run(
                     product_identity_key=ledger_key,
                     reference_kind=reference_kind,
                     category=canonical,
-                    condition="new",
+                    # Outlet stock is opened, scratched or ex-display, so it is
+                    # judged against the used-stock bar. Derived above from
+                    # is_outlet and already used to pick the reference lane;
+                    # hard-coding "new" here scored outlet units against the
+                    # new-stock threshold.
+                    condition=condition,
                 )
                 reason = report_reason(deal)
                 if not reason:
