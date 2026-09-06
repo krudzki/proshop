@@ -332,6 +332,8 @@ async def run(
                 observation_key = f"proshop:{product.product_id}"
 
                 if not dry_run:
+                    # Catalog state is recorded either way: the address was
+                    # visited and must not come straight back to the queue.
                     product_catalog.append([product.url])
                     product_catalog.save_record(
                         Page(
@@ -341,6 +343,30 @@ async def run(
                             price=product.price,
                         )
                     )
+
+                if not product.purchasable:
+                    # An amount nobody can order is not a price any shop may be
+                    # scored against. Measured 2026-09-06: HP 669324-B21 sat at
+                    # 1,015 PLN while unbuyable and was reused 8 times as a
+                    # cross-shop reference.
+                    #
+                    # Only this product's own lane is withdrawn -- outlet and
+                    # retail are separate offers for the same part -- and
+                    # historia_cen keeps every observation, because what a shop
+                    # asked is still evidence about the market.
+                    outcome.unavailable += 1
+                    if not dry_run:
+                        database.prices.retire_current(
+                            ledger_key,
+                            SELLER,
+                            source,
+                            name=product.name,
+                            url=product.url,
+                            mpn=product.mpn,
+                        )
+                    continue
+
+                if not dry_run:
                     database.prices.save_record(
                         ledger_key,
                         SELLER,
@@ -359,10 +385,6 @@ async def run(
                         channel=STORE,
                         product_identity_key=ledger_key,
                     )
-
-                if not product.purchasable:
-                    outcome.unavailable += 1
-                    continue
 
                 reference = reference_from_ledger(
                     database.connection,
