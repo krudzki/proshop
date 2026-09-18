@@ -1,0 +1,15 @@
+[Unit]
+Description=Proshop Poland electronics scanner via residential proxy (B, PL sessid, 40/2.5)
+Documentation=file:///home/krzysztof/serwer-minipc/SERWER-CONTEXT.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/krzysztof/proshop
+EnvironmentFile=/home/krzysztof/.config/amazon-de-proxy.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PROSHOP_PAGES_PER_PASS=40
+Environment=PROSHOP_REQUEST_DELAY_S=2.5
+ExecStart=/home/krzysztof/proshop/bin/proshop-de-proxy-run.sh /home/krzysztof/fleet-venv/bin/python -m proshop.scanner
+SuccessExitStatus=4

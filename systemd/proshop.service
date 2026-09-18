@@ -1,0 +1,13 @@
+[Unit]
+Description=Proshop Poland electronics scanner (P1-first full coverage)
+Documentation=file:///home/krzysztof/serwer-minipc/SERWER-CONTEXT.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/krzysztof/proshop
+ExecStart=/home/krzysztof/fleet-venv/bin/python -m proshop.scanner
+# 429/403 challenge is an expected store signal, not a unit failure — keep the
+# timer on its OnUnitInactiveSec cadence and avoid warden noise.
+SuccessExitStatus=4
