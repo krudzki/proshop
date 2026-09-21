@@ -168,6 +168,41 @@ def should_refresh_catalog(last_refresh: str | None, dry_run: bool, interval_hou
     return not dry_run and should_refresh(last_refresh, interval_hours)
 
 
+# How long a refused category refresh waits before trying again.
+#
+# The refresh success timestamp is only written when the sweep COMPLETES, and
+# a refusal forces `complete=False`, so on its own it can never delay a retry:
+# measured live 2026-09-21, the scanner re-ran the refresh on every one of 24
+# consecutive cycles, firing up to 12 root requests each time into an address
+# Cloudflare was already refusing. The scanner was sustaining the very penalty
+# it was waiting out.
+#
+# Sized above the 17-minute timer cadence so the retry genuinely skips cycles,
+# and well under the 24h refresh interval so a transient block does not cost a
+# day of category discovery.
+REFRESH_BACKOFF_MINUTES = 60
+REFUSED_REFRESH_STATE_KEY = "proshop_categories_refused"
+
+
+def refresh_backoff_until(
+    refused_at: str | None,
+    now: datetime | None = None,
+    minutes: int = REFRESH_BACKOFF_MINUTES,
+) -> bool:
+    """True while a refused refresh must NOT be retried.
+
+    Unparseable or absent state means "never refused", so a corrupt value can
+    only cost one extra refresh attempt - it can never wedge discovery off.
+    """
+    if not refused_at:
+        return False
+    try:
+        refused = datetime.fromisoformat(refused_at)
+    except ValueError:
+        return False
+    return (now or datetime.now()) - refused < timedelta(minutes=minutes)
+
+
 def _base_listing_url(url: str) -> str:
     parts = urlsplit(url)
     return urlunsplit((parts.scheme or "https", parts.netloc or "www.proshop.pl", parts.path.rstrip("/"), "", ""))
@@ -270,11 +305,16 @@ async def run(
             database.get_state(REFRESH_STATE_KEY),
             dry_run,
             settings.category_refresh_hours,
-        ):
+        ) and not refresh_backoff_until(database.get_state(REFUSED_REFRESH_STATE_KEY)):
             added, complete = await refresh_categories(fetcher, listing_catalog, database.connection)
             outcome.categories_added = added
             if complete:
                 database.set_state(REFRESH_STATE_KEY, datetime.now().isoformat())
+                database.set_state(REFUSED_REFRESH_STATE_KEY, "")
+            elif fetcher.shop_refusal:
+                # Record the refusal itself, not just the missing success, so
+                # the next cycle can space the retry instead of knocking again.
+                database.set_state(REFUSED_REFRESH_STATE_KEY, datetime.now().isoformat())
             logger.info(
                 "proshop_categories_refreshed",
                 added=added,
@@ -294,7 +334,24 @@ async def run(
             status, html = await fetcher(page.url)
             if fetcher.shop_refusal:
                 outcome.shop_refusal = True
-                logger.warning("store_refused", status=status, url=page.url)
+                # Report the request that was actually refused. A latched
+                # refusal short-circuits without issuing a request, so
+                # `page.url` here is merely the next queue entry and blaming
+                # it sends the next reader after an innocent page.
+                logger.warning(
+                    "store_refused",
+                    status=status,
+                    url=fetcher.refused_url or page.url,
+                    reached_listing_loop=fetcher.refused_url == page.url,
+                )
+                # A refusal anywhere in the pass means the address is
+                # penalised, so the next cycle's refresh must back off too -
+                # otherwise a refusal met in the listing loop still leaves 12
+                # root requests queued up for 17 minutes' time.
+                if not dry_run:
+                    database.set_state(
+                        REFUSED_REFRESH_STATE_KEY, datetime.now().isoformat()
+                    )
                 break
             if status == 0 or status >= 500 or not html:
                 outcome.listing_fetch_errors += 1

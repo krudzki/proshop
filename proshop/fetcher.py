@@ -29,6 +29,11 @@ class CurlCffiFetcher:
         self._session = session or self._new_session()
         self._first = True
         self.shop_refusal = False
+        # Which request was actually refused. Once `shop_refusal` latches, every
+        # later call short-circuits and returns status 0 without touching the
+        # network, so the caller's own URL says nothing about the refusal. Live
+        # journals blamed an innocent listing page for hours because of this.
+        self.refused_url: str | None = None
 
     def _new_session(self):
         return requests.Session(impersonate="chrome131", trust_env=True)
@@ -58,6 +63,7 @@ class CurlCffiFetcher:
             hidden_refusal = any(marker in lowered for marker in BLOCK_MARKERS)
             if status in REFUSAL_STATUS or hidden_refusal:
                 self.shop_refusal = True
+                self.refused_url = url
                 return status, body
             if status in TRANSIENT_STATUS and attempt < 2:
                 continue
