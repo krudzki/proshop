@@ -203,6 +203,56 @@ def refresh_backoff_until(
     return (now or datetime.now()) - refused < timedelta(minutes=minutes)
 
 
+# The shop meters the HOUR, so the pass budget alone cannot express the
+# constraint. Measured 2026-09-21 across 43 cycles, counting pages fetched in
+# the hour preceding each pass:
+#
+#     39 served passes   0-218 pages in the previous hour (median 50)
+#      4 refused passes  193, 222, 222, 313
+#
+# 160/h sits under the overlap with margin, because a breach is not
+# self-healing: once overspent the shop refuses a SINGLE request from an
+# otherwise idle address for hours. 40 pages x 4 cycles/hour reaches exactly
+# this cap, so the guard is inert while the timer keeps its cadence and only
+# bites when a deep backlog would otherwise let one hour run away - which is
+# precisely what happened on 2026-09-21, when a healthy 80-page budget
+# produced 103/100/95-page cycles and 222 pages in one hour.
+HOURLY_PAGE_CAP = 160
+HOURLY_WINDOW = timedelta(hours=1)
+
+
+def pages_allowed_now(
+    recent_cycles: list[dict],
+    pass_budget: int,
+    hourly_cap: int = HOURLY_PAGE_CAP,
+    now: datetime | None = None,
+) -> int:
+    """How many listing pages this pass may still fetch.
+
+    Fails OPEN: unreadable or absent history means no evidence of a breach, so
+    the pass keeps its normal budget. A guard that silences the scanner
+    whenever it cannot read the past is the silent-starvation shape and is
+    worse than the burst it prevents.
+    """
+    moment = now or datetime.now()
+    spent = 0
+    for cycle in recent_cycles or ():
+        stamp = cycle.get("ts")
+        if not stamp:
+            continue
+        try:
+            when = datetime.fromisoformat(str(stamp))
+        except (ValueError, TypeError):
+            continue
+        if moment - when >= HOURLY_WINDOW:
+            continue
+        try:
+            spent += int(cycle.get("listing_pages") or 0)
+        except (TypeError, ValueError):
+            continue
+    return max(0, min(pass_budget, hourly_cap - spent))
+
+
 def _base_listing_url(url: str) -> str:
     parts = urlsplit(url)
     return urlunsplit((parts.scheme or "https", parts.netloc or "www.proshop.pl", parts.path.rstrip("/"), "", ""))
@@ -323,6 +373,26 @@ async def run(
             )
 
         pass_limit = limit or settings.pages_per_pass
+        if not dry_run:
+            # Cap the HOUR, not just the pass. A per-pass budget is safe on
+            # average and still breaches whenever the backlog is deep enough
+            # to fill it - which is how a healthy 80-page budget produced
+            # 222 pages in one hour on 2026-09-21 and cost six hours of
+            # refusals. An explicit --limit is a deliberate operator choice
+            # and is capped too, since the shop meters us either way.
+            try:
+                history = database.recent_cycles(STORE, limit=12)
+            except Exception:  # noqa: BLE001 - fail open, never block the lane
+                history = []
+            granted = pages_allowed_now(history, pass_limit)
+            if granted < pass_limit:
+                logger.info(
+                    "hourly_budget_applied",
+                    requested=pass_limit,
+                    granted=granted,
+                    cap=HOURLY_PAGE_CAP,
+                )
+            pass_limit = granted
         pages = (
             _dry_run_pages(pass_limit)
             if dry_run
