@@ -237,6 +237,17 @@ def _dry_run_pages(limit: int) -> list[QueuedPage]:
     return [QueuedPage(url=url, key="", name=name, price=None, checked_at=None) for url, name in rows]
 
 
+def alert_cap(products_seen: int, settings: Settings) -> int:
+    """How many alerts one pass may deliver before it looks like a fault.
+
+    Scaled by the work actually done: an anomaly is a RATE, not a count, so a
+    pass reading five times as much may legitimately report more. The
+    configured absolute value stays as a floor so a tiny pass cannot spam.
+    """
+    ceiling = getattr(settings, "alert_rate_ceiling", 0.0)
+    return max(settings.max_alerts_per_cycle, int(products_seen * ceiling))
+
+
 async def run(
     settings: Settings,
     limit: int | None = None,
@@ -490,12 +501,14 @@ async def run(
                 )
 
         outcome.qualified = len(pending)
-        if send_alerts and not dry_run and len(pending) > settings.max_alerts_per_cycle:
+        cap = alert_cap(outcome.products_seen, settings)
+        if send_alerts and not dry_run and len(pending) > cap:
             outcome.circuit_breaker = True
             logger.error(
                 "proshop_alert_circuit_breaker",
                 qualified=len(pending),
-                cap=settings.max_alerts_per_cycle,
+                cap=cap,
+                products_seen=outcome.products_seen,
             )
         elif send_alerts and not dry_run:
             for alert in pending:

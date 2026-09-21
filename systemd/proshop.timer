@@ -3,7 +3,25 @@ Description=Proshop scanner every 15 minutes
 
 [Timer]
 OnBootSec=9min
-OnUnitActiveSec=15min
+# Measure the gap from the END of the previous pass only.
+#
+# OnUnitActiveSec was removed 2026-09-21. systemd arms BOTH conditions and
+# fires on whichever elapses first, so keeping the two at the same value
+# quietly couples the recovery gap to the pass duration: a 15-minute
+# OnUnitActiveSec counted from the START of a 7-minute pass leaves the shop
+# only ~8 minutes of rest, and the longer the pass the shorter the rest.
+#
+# While a pass took ~70 seconds the difference was invisible. At the measured
+# 120-page budget a pass takes 384-477s, and that is exactly when the gap
+# collapsed. Measured over 41 cycles the same day:
+#
+#     37 served passes   idle 12.9-26.6 min before starting (median 15.5)
+#      2 refused passes   idle 2.2 min and 10.1 min
+#      3 passes >= 95 pages: 0 refusals, 384-477s each
+#
+# So the refusals were not caused by the larger pass - the large passes all
+# succeeded. They were caused by the NEXT cycle starting before the shop's
+# rate window had reset. Size is safe; haste is not.
 OnUnitInactiveSec=15min
 RandomizedDelaySec=90
 AccuracySec=30s

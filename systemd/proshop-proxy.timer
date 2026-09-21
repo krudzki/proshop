@@ -1,5 +1,27 @@
 [Unit]
 Description=Proshop proxy scan every 15 minutes (B)
+# PARKED 2026-09-21. This timer is intentionally left in the repository and
+# disabled rather than deleted, so the lane can return with one
+# `systemctl --user enable --now proshop-proxy.timer`.
+#
+# Why it was parked, measured rather than assumed:
+#
+#   * It buys no COVERAGE. Both units run `python -m proshop.scanner` against
+#     one queue - `strony` filtered by `sklep`, ordered by least-recently
+#     checked (proshop/queue.py). There is no separate cursor, so the proxy
+#     lane only ever added throughput to the same lap. Parking it cannot
+#     shrink the scanned scope.
+#   * It was producing nothing. Every cycle for days: products_seen=0,
+#     listing_fetch_errors=40, reported=0 - the dead-proxy shape, because the
+#     DataImpulse account is exhausted. The plain lane meanwhile served
+#     425-463 products a cycle with fetch_errors 0-1.
+#   * The shop does not require a proxy from this box. 48 consecutive listing
+#     pages were served direct before Cloudflare appeared, so the residential
+#     exit is not what makes Proshop reachable.
+#
+# Re-enable it only if a measurement shows the plain lane cannot keep the
+# catalogue fresh on its own; if the proxy account is topped up, prefer
+# spending that bandwidth on shops that genuinely refuse a direct request.
 
 [Timer]
 OnBootSec=12min
