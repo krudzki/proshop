@@ -18,7 +18,8 @@ class Settings(CoreSettings):
     proshop_enabled: bool = Field(default=False)
     proshop_notify: bool = Field(default=False)
     pages_per_pass: int = Field(
-        # Sized by the shop's HOURLY allowance, not by what one burst can do.
+        # Sized by the shop's allowance with MARGIN, because a breach is not
+        # self-healing.
         #
         # An isolated probe walked 129 pages at 2.5s spacing with no refusal,
         # and a 120-page budget was deployed on that basis. It refused in
@@ -31,14 +32,16 @@ class Settings(CoreSettings):
         #     39 served passes   0-218 pages in the previous hour (median 50)
         #      4 refused passes  193, 222, 222, 313
         #
-        # The band overlaps around 200/h, so the ceiling is roughly there. A
-        # 120-page pass every 15 minutes asks for 480/h - more than twice the
-        # allowance - and the refusals landed on the hottest category
-        # (Karta-graficzna) once the hour's budget was spent.
+        # Do NOT read 218 as a target. Once the allowance is overspent the
+        # shop keeps refusing a SINGLE request from an otherwise idle address
+        # - measured HTTP 429, 6,010-byte body, unbroken from t+0 to t+10.5
+        # minutes of complete quiet, timer stopped. It is a penalty with
+        # memory, not a sliding window, so overshooting costs far more than
+        # the excess pages and the budget needs margin rather than precision.
         #
-        # 40 pages per 15-minute cycle is 160/h, inside the measured safe
-        # band with margin, and still laps the 1,489-page listing queue in
-        # ~9.3h against the 18.6h the previous 20-page runtime managed.
+        # 40 pages per 15-minute cycle is 160/h, well under the band, and
+        # still laps the 1,489-page listing queue in ~9.3h against the 18.6h
+        # the previous 20-page runtime managed.
         default=40,
         validation_alias=AliasChoices("pages_per_pass", "proshop_pages_per_pass"),
         ge=1,

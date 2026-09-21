@@ -1,7 +1,7 @@
-"""Guard Proshop's scan budget against the shop's HOURLY allowance.
+"""Guard Proshop's scan budget against the shop's allowance, with margin.
 
-The mistake this file now exists to prevent: an isolated probe walked 129
-pages at 2.5s spacing with no refusal, a 120-page budget was deployed on that
+The mistake this file exists to prevent: an isolated probe walked 129 pages
+at 2.5s spacing with no refusal, a 120-page budget was deployed on that
 evidence, and production refused within two hours. A probe measures ONE burst
 after a long idle. Production repeats that burst every 15 minutes, and the
 shop meters cumulatively.
@@ -12,15 +12,16 @@ in the HOUR PRECEDING each pass:
     39 served passes    0-218 pages in the previous hour (median 50)
      4 refused passes   193, 222, 222, 313
 
-The bands overlap around 200/h, so that is where the ceiling sits. Refusals
-landed on the hottest category (Karta-graficzna, 3 of 4) once the hour's
-allowance was spent - not on a specific page, and not because any single pass
-was too long: the three longest passes of the day (103, 100, 95 pages) were
-all served.
+218 is NOT a target. Once the allowance is overspent, the shop keeps refusing
+a single request from an otherwise idle address: HTTP 429 with a 6,010-byte
+body, unbroken from t+0 to t+10.5 minutes of complete quiet with the timer
+stopped. That is a penalty with memory, not a sliding window - a breach costs
+far more than the excess pages, so the budget is sized with margin rather
+than tuned to the edge.
 
-So the quantity to pin is pages PER HOUR, which is a property of the budget
-and the timer together. A test that only checks `pages_per_pass` cannot see
-it, which is exactly why the first version of this file passed a
+The quantity to pin is therefore pages PER HOUR, which is a property of the
+budget and the timer together. A test that only checks `pages_per_pass`
+cannot see it, which is why the first version of this file passed a
 configuration that failed in production within two hours.
 """
 
@@ -35,7 +36,9 @@ from proshop.settings import Settings
 # Highest hourly load that was served, and lowest that drew a refusal.
 MEASURED_SERVED_MAX_PER_HOUR = 218
 MEASURED_REFUSED_MIN_PER_HOUR = 193
-# Stay below the overlapping band rather than at its edge.
+# Sized below the overlapping band, not at its edge: the penalty outlives the
+# traffic that caused it (>=10.5 min of 429 on an idle address), so the cost
+# of being slightly wrong is asymmetric.
 SAFE_RATE_PER_HOUR = 170
 
 # The longest single pass observed without refusal, from idle. Still a real
