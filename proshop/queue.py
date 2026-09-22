@@ -10,6 +10,12 @@ from proshop.categories import canonical_category, is_focus, priority_of_slug
 
 CANDIDATE_MULTIPLIER = 4
 FULL_SCAN_CAP = 50_000
+#: Slots per pass reserved for pages nobody has ever opened. Priority ordering
+#: is otherwise absolute, so an unvisited P2/P3 category root loses every tie
+#: to the 1113 already-checked P1 pages and is never scanned at all. Measured
+#: 2026-09-22: 122 roots (Activity Trackers ... Bateria) stayed at
+#: `sprawdzone IS NULL` across a full 24-hour journal.
+UNVISITED_RESERVE = 4
 _PRIORITY_RANK = {"P1": 0, "P2": 1, "P3": 2}
 
 
@@ -76,6 +82,18 @@ def order_pages(pages: list[QueuedPage], limit: int, focus_share: float) -> list
     )
     chosen = focus[:quota]
     taken = {page.url for page in chosen}
+    # A small guaranteed slice for pages with no `sprawdzone` at all. Without
+    # it the priority sort below is absolute and an unvisited P3 root can
+    # never outrank a freshly-checked P1 page, so it waits forever -- the
+    # catalogue reports a stable "N not checked yet" that never falls.
+    unvisited_budget = max(0, min(UNVISITED_RESERVE, limit - len(chosen)))
+    for page in general:
+        if unvisited_budget <= 0:
+            break
+        if page.checked_at is None and page.url not in taken:
+            chosen.append(page)
+            taken.add(page.url)
+            unvisited_budget -= 1
     for page in [*general, *focus[quota:]]:
         if len(chosen) >= limit:
             break
