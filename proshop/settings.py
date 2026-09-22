@@ -18,31 +18,17 @@ class Settings(CoreSettings):
     proshop_enabled: bool = Field(default=False)
     proshop_notify: bool = Field(default=False)
     pages_per_pass: int = Field(
-        # Sized by the shop's allowance with MARGIN, because a breach is not
-        # self-healing.
+        # The binding limit is a short-burst threshold, not the older hourly
+        # estimate. Measured 2026-09-22 after 32 minutes of complete quiet:
+        # GPU pagination requests 1..12 returned HTTP 200 at the production
+        # 2.5s cadence; request 13 returned HTTP 429. The same URLs all served
+        # when spaced 45 seconds apart, proving the URL was not the cause.
         #
-        # An isolated probe walked 129 pages at 2.5s spacing with no refusal,
-        # and a 120-page budget was deployed on that basis. It refused in
-        # production within two hours. The probe measured a single burst
-        # after a long idle; production repeats a burst every 15 minutes.
-        #
-        # Measured 2026-09-21 across 43 cycles, counting pages fetched in the
-        # HOUR PRECEDING each pass:
-        #
-        #     39 served passes   0-218 pages in the previous hour (median 50)
-        #      4 refused passes  193, 222, 222, 313
-        #
-        # Do NOT read 218 as a target. Once the allowance is overspent the
-        # shop keeps refusing a SINGLE request from an otherwise idle address
-        # - measured HTTP 429, 6,010-byte body, unbroken from t+0 to t+10.5
-        # minutes of complete quiet, timer stopped. It is a penalty with
-        # memory, not a sliding window, so overshooting costs far more than
-        # the excess pages and the budget needs margin rather than precision.
-        #
-        # 40 pages per 15-minute cycle is 160/h, well under the band, and
-        # still laps the 1,489-page listing queue in ~9.3h against the 18.6h
-        # the previous 20-page runtime managed.
-        default=40,
+        # Keep the listing budget at 12, and separately cap ALL real contacts
+        # in the cycle (category refreshes and retries included) in scanner.py.
+        # A breach is not self-healing: the penalty survived >=10.5 minutes of
+        # silence, so crossing the line costs much more than one skipped page.
+        default=12,
         validation_alias=AliasChoices("pages_per_pass", "proshop_pages_per_pass"),
         ge=1,
         le=400,
@@ -54,10 +40,9 @@ class Settings(CoreSettings):
         le=1.0,
     )
     request_delay_s: float = Field(
-        # Spacing still matters within a pass - at 0.6s and 1.2s the shop
-        # refused around page 48 even from idle - but it is not the binding
-        # constraint. 2.5s sustained 129 pages from idle, so it is kept as
-        # the in-pass pacing while `pages_per_pass` enforces the hourly rate.
+        # Keep the measured production pacing. It is not sufficient on its
+        # own: contact 13 was refused at this exact 2.5s cadence, so the hard
+        # per-cycle contact budget is the binding protection.
         default=2.5,
         validation_alias=AliasChoices("request_delay_s", "proshop_request_delay_s"),
         ge=0.5,

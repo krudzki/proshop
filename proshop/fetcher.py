@@ -1,22 +1,18 @@
 """Coherent Chrome-TLS transport for Proshop listings.
 
-A brand-new session is challenged on its FIRST contact and admitted on a
-later one. Measured 2026-09-21/22 with the timer stopped so the probe could
-not re-arm the shop's penalty:
+Two independent protections live at this boundary:
 
-    fresh session, one knock              challenged 12/12 over 110 min
-    fresh session, knock + 180s + knock   served, 192 KB of listing HTML
-    controlled trial, arms alternated     two-knock 2/2, single-knock 0/2
+* A historical cold-session probe found that a challenge on a session's first
+  contact could clear after a long pause, so an unserved session may retry a
+  bounded number of times. Once any real page has been served, a refusal is
+  final and is never retried.
+* A controlled production-cadence probe on 2026-09-22, after 32 minutes of
+  complete quiet, served contacts 1..12 and returned HTTP 429 on contact 13.
+  The transport therefore counts every real contact, including retries, so a
+  page-loop limit cannot cross that boundary invisibly.
 
-The scanner builds a fetcher per cycle, so every cycle started cold, was
-challenged once and latched a store-wide refusal - 28 consecutive cycles
-reporting a block that a second request would have cleared.
-
-The retry is asymmetric on purpose. A cold session re-contacts after a pause,
-because a challenge on first contact is a warm-up rather than a verdict. A
-warm session latches immediately: it has already been served, so a refusal is
-the shop's answer, and extra requests are expensive here - the rate penalty
-outlives the traffic that earned it.
+Both controls preserve one cookie/TLS identity for the pass. The scanner sets
+the per-cycle contact budget; standalone tests may leave it unbounded.
 """
 
 from __future__ import annotations
@@ -52,6 +48,7 @@ class CurlCffiFetcher:
         timeout_s: float = 30.0,
         cold_retry_wait_s: float = COLD_RETRY_WAIT_S,
         cold_retry_knocks: int = COLD_RETRY_KNOCKS,
+        max_requests: int | None = None,
     ) -> None:
         self._delay = max(0.0, delay_s)
         self._sleep = sleeper
@@ -71,6 +68,16 @@ class CurlCffiFetcher:
         self._cold_retry_wait = max(0.0, cold_retry_wait_s)
         self._cold_retry_knocks = max(1, cold_retry_knocks)
         self._served = False
+        self._max_requests = None if max_requests is None else max(0, int(max_requests))
+        self.requests_made = 0
+        self.budget_exhausted = False
+
+    @property
+    def remaining_requests(self) -> int | None:
+        """Real network contacts left, or ``None`` for an unbounded helper."""
+        if self._max_requests is None:
+            return None
+        return max(0, self._max_requests - self.requests_made)
 
     def _new_session(self):
         return requests.Session(impersonate="chrome131", trust_env=True)
@@ -89,7 +96,10 @@ class CurlCffiFetcher:
                 if status == 200:
                     self._served = True
                 return status, body
-            if knock == knocks - 1:
+            no_retry_budget = self.remaining_requests == 0
+            if knock == knocks - 1 or no_retry_budget:
+                if no_retry_budget:
+                    self.budget_exhausted = True
                 self.shop_refusal = True
                 self.refused_url = url
                 return status, body
@@ -104,9 +114,17 @@ class CurlCffiFetcher:
         cold or warm, something this method deliberately does not know.
         """
         for attempt in range(3):
+            if self.remaining_requests == 0:
+                self.budget_exhausted = True
+                return 0, "", False
             if not self._first:
                 await self._sleep(self._delay if attempt == 0 else max(self._delay, 2**attempt))
             self._first = False
+            # Count attempted contacts, not successful responses. Cloudflare
+            # sees a timed-out or broken request too, and retries must not
+            # create the measured-refused thirteenth contact behind the page
+            # loop's back.
+            self.requests_made += 1
             try:
                 response = await asyncio.to_thread(
                     self._session.get,

@@ -196,3 +196,55 @@ def test_run_actually_applies_the_cap_at_the_call_site(tmp_path, monkeypatch):
         f"203 pages already spent this hour, yet the pass asked for "
         f"{seen_limits[0]} more"
     )
+
+
+def test_category_refresh_contacts_reduce_the_listing_budget(tmp_path, monkeypatch):
+    """All contacts share the measured 12-request burst budget.
+
+    A normal category refresh contacts nine roots before the listing loop.
+    Limiting only `pages_per_pass` to 12 would still send 21 contacts and
+    reproduce the measured 429 on contact 13.
+    """
+    import asyncio
+
+    budgets = []
+
+    class _BudgetedFetcher:
+        def __init__(self, *_a, max_requests=None, **_k):
+            budgets.append(max_requests)
+            self.remaining_requests = max_requests if max_requests is not None else 999
+            self.requests_made = 0
+            self.budget_exhausted = False
+            self.shop_refusal = False
+            self.refused_url = None
+
+        async def __call__(self, _url):
+            self.requests_made += 1
+            self.remaining_requests -= 1
+            return 200, (
+                '<div id="subCategoryList">'
+                '<a href="/RAM">RAM</a>'
+                '</div>'
+            )
+
+        def close(self):
+            return None
+
+    seen_limits = []
+
+    def _spy(_conn, _store, limit, _share):
+        seen_limits.append(limit)
+        return []
+
+    settings = _settings(f"sqlite:///{tmp_path}/products.db")
+    settings.pages_per_pass = 12
+    settings.category_refresh_hours = 24
+    monkeypatch.setattr(scanner, "CurlCffiFetcher", _BudgetedFetcher)
+    monkeypatch.setattr(scanner, "due_for_pass", _spy)
+
+    asyncio.run(scanner.run(settings, dry_run=False, notify=False))
+
+    assert budgets == [scanner.MAX_CONTACTS_PER_CYCLE]
+    assert seen_limits == [3], (
+        f"nine refresh contacts should leave three listing contacts, got {seen_limits}"
+    )

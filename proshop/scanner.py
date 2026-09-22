@@ -6,7 +6,7 @@ import argparse
 import asyncio
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import structlog
 from deal_pipeline.catalog import Catalog, Page
@@ -86,6 +86,7 @@ class ScanResult:
     shop_refusal: bool = False
     categories_added: int = 0
     listing_pages_added: int = 0
+    listing_pages_removed: int = 0
 
 
 @dataclass(frozen=True)
@@ -203,20 +204,18 @@ def refresh_backoff_until(
     return (now or datetime.now()) - refused < timedelta(minutes=minutes)
 
 
-# The shop meters the HOUR, so the pass budget alone cannot express the
-# constraint. Measured 2026-09-21 across 43 cycles, counting pages fetched in
-# the hour preceding each pass:
+# Two independent limits were measured. The binding one is the short burst:
+# after 32 minutes of complete quiet, contacts 1..12 returned 200 and contact
+# 13 returned 429 at the production 2.5s cadence. It must cover every real
+# network contact in a cycle, including category refreshes and retries.
 #
-#     39 served passes   0-218 pages in the previous hour (median 50)
-#      4 refused passes  193, 222, 222, 313
-#
-# 160/h sits under the overlap with margin, because a breach is not
-# self-healing: once overspent the shop refuses a SINGLE request from an
-# otherwise idle address for hours. 40 pages x 4 cycles/hour reaches exactly
-# this cap, so the guard is inert while the timer keeps its cadence and only
-# bites when a deep backlog would otherwise let one hour run away - which is
-# precisely what happened on 2026-09-21, when a healthy 80-page budget
-# produced 103/100/95-page cycles and 222 pages in one hour.
+# The older hourly guard remains as a second line of defence. On 2026-09-21,
+# refused passes followed 193, 222, 222 and 313 listing pages in the preceding
+# hour, and the penalty survived >=10.5 minutes of silence. With the new
+# 12-contact cycle cap and 15-minute timer it is normally inert (~48/h), but it
+# still prevents a config or explicit operator limit from recreating the old
+# runaway backlog.
+MAX_CONTACTS_PER_CYCLE = 12
 HOURLY_PAGE_CAP = 160
 HOURLY_WINDOW = timedelta(hours=1)
 
@@ -263,6 +262,62 @@ def listing_page_urls(url: str, page_count: int, cap: int = 400) -> list[str]:
     base = _base_listing_url(url)
     final_page = max(1, min(int(page_count), int(cap)))
     return [base, *[f"{base}?pn={page}" for page in range(2, final_page + 1)]]
+
+
+def prune_listing_pages(conn, url: str, final_page: int) -> int:
+    """Remove stale pagination addresses beyond a listing's current end.
+
+    The shop's range can shrink (measured live: GPU 17 -> 15, RAM 54 -> 53).
+    Discovery used to append the new range without retiring the old tail, so
+    the scanner kept spending contacts on pages the shop no longer offered.
+    Delete exact URLs only; a broad prefix delete could touch another category.
+    """
+    base = _base_listing_url(url)
+    rows = conn.execute(
+        "SELECT url FROM strony WHERE sklep = ? AND url LIKE ?",
+        (LISTING_STORE, f"{base}?pn=%"),
+    ).fetchall()
+    stale: list[str] = []
+    for row in rows:
+        candidate = str(row["url"] if hasattr(row, "keys") else row[0])
+        values = parse_qs(urlsplit(candidate).query).get("pn", [])
+        if len(values) != 1:
+            continue
+        try:
+            page_number = int(values[0])
+        except (TypeError, ValueError):
+            continue
+        if page_number > max(1, int(final_page)):
+            stale.append(candidate)
+    if stale:
+        conn.executemany(
+            "DELETE FROM strony WHERE sklep = ? AND url = ?",
+            [(LISTING_STORE, stale_url) for stale_url in stale],
+        )
+        conn.commit()
+    return len(stale)
+
+
+def sync_listing_page_range(
+    catalog: Catalog,
+    conn,
+    page: Page,
+    *,
+    page_count: int,
+    cap: int,
+) -> tuple[int, int]:
+    """Append the live range, stamp the visit, then retire its stale tail."""
+    final_page = min(max(1, int(page_count)), max(1, int(cap)))
+    expanded = [
+        (listing_url, page.name)
+        for listing_url in listing_page_urls(page.url, final_page, cap)
+    ]
+    added = _append_named(catalog, conn, expanded)
+    # A stale URL can itself be the page currently being visited. Stamp it
+    # before pruning; the opposite order silently resurrects that stale row.
+    catalog.save_record(page)
+    removed = prune_listing_pages(conn, page.url, final_page)
+    return added, removed
 
 
 def source_for(is_outlet: bool) -> str:
@@ -344,7 +399,10 @@ async def run(
     outcome = ScanResult()
     rejected = RejectedDrops()
     database = Database(url=settings.database_url)
-    fetcher = CurlCffiFetcher(settings.request_delay_s)
+    fetcher = CurlCffiFetcher(
+        settings.request_delay_s,
+        max_requests=MAX_CONTACTS_PER_CYCLE,
+    )
     pending: list[PendingAlert] = []
     try:
         listing_catalog = Catalog(database.connection, LISTING_STORE)
@@ -393,6 +451,16 @@ async def run(
                     cap=HOURLY_PAGE_CAP,
                 )
             pass_limit = granted
+        remaining_contacts = getattr(fetcher, "remaining_requests", None)
+        if remaining_contacts is not None and remaining_contacts < pass_limit:
+            logger.info(
+                "contact_budget_applied",
+                requested=pass_limit,
+                granted=remaining_contacts,
+                contacts_used=getattr(fetcher, "requests_made", 0),
+                cap=MAX_CONTACTS_PER_CYCLE,
+            )
+            pass_limit = remaining_contacts
         pages = (
             _dry_run_pages(pass_limit)
             if dry_run
@@ -402,6 +470,13 @@ async def run(
 
         for page in pages:
             status, html = await fetcher(page.url)
+            if getattr(fetcher, "budget_exhausted", False):
+                logger.info(
+                    "contact_budget_exhausted",
+                    contacts_used=getattr(fetcher, "requests_made", 0),
+                    cap=MAX_CONTACTS_PER_CYCLE,
+                )
+                break
             if fetcher.shop_refusal:
                 outcome.shop_refusal = True
                 # Report the request that was actually refused. A latched
@@ -441,18 +516,15 @@ async def run(
                 outcome.focus_pages += 1
 
             if not dry_run:
-                expanded = [
-                    (url, page.name)
-                    for url in listing_page_urls(
-                        page.url,
-                        listing_page_count(html),
-                        settings.max_listing_pages,
-                    )
-                ]
-                outcome.listing_pages_added += _append_named(
-                    listing_catalog, database.connection, expanded
+                added, removed = sync_listing_page_range(
+                    listing_catalog,
+                    database.connection,
+                    Page(url=page.url, name=page.name, price=None),
+                    page_count=listing_page_count(html),
+                    cap=settings.max_listing_pages,
                 )
-                listing_catalog.save_record(Page(url=page.url, name=page.name, price=None))
+                outcome.listing_pages_added += added
+                outcome.listing_pages_removed += removed
 
             for product in products:
                 if product.product_id in seen_ids:

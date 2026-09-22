@@ -1,28 +1,19 @@
-"""Guard Proshop's scan budget against the shop's allowance, with margin.
+"""Guard Proshop's scan budget against both measured refusal boundaries.
 
-The mistake this file exists to prevent: an isolated probe walked 129 pages
-at 2.5s spacing with no refusal, a 120-page budget was deployed on that
-evidence, and production refused within two hours. A probe measures ONE burst
-after a long idle. Production repeats that burst every 15 minutes, and the
-shop meters cumulatively.
+The older production incident established an hourly penalty band: bursts that
+accumulated 193-313 pages in the preceding hour led to a penalty that survived
+at least 10.5 minutes of complete silence. That justified the rolling-hour
+guard, but did not explain later refusals at much lower hourly volume.
 
-Measured 2026-09-21 across 43 production cycles, counting the pages fetched
-in the HOUR PRECEDING each pass:
+A controlled probe on 2026-09-22 stopped production, waited 32 minutes, then
+requested GPU pagination at the real 2.5s cadence. Pages 1..12 returned HTTP
+200 and request 13 returned HTTP 429 after 32.9 seconds. The same deep URLs had
+returned 200 in a 45-second-spaced control. The binding production constraint
+is therefore a 12-contact cycle burst; the hourly cap remains a secondary
+failsafe.
 
-    39 served passes    0-218 pages in the previous hour (median 50)
-     4 refused passes   193, 222, 222, 313
-
-218 is NOT a target. Once the allowance is overspent, the shop keeps refusing
-a single request from an otherwise idle address: HTTP 429 with a 6,010-byte
-body, unbroken from t+0 to t+10.5 minutes of complete quiet with the timer
-stopped. That is a penalty with memory, not a sliding window - a breach costs
-far more than the excess pages, so the budget is sized with margin rather
-than tuned to the edge.
-
-The quantity to pin is therefore pages PER HOUR, which is a property of the
-budget and the timer together. A test that only checks `pages_per_pass`
-cannot see it, which is why the first version of this file passed a
-configuration that failed in production within two hours.
+The guard must also remain useful: GPU and RAM retain a fast-lap guarantee,
+and the general catalogue retains an explicit anti-starvation bound.
 """
 
 from __future__ import annotations
@@ -41,9 +32,12 @@ MEASURED_REFUSED_MIN_PER_HOUR = 193
 # of being slightly wrong is asymmetric.
 SAFE_RATE_PER_HOUR = 170
 
-# The longest single pass observed without refusal, from idle. Still a real
-# bound within one pass, just not the binding one.
-MEASURED_SAFE_BURST = 129
+# Measured 2026-09-22 after 32 minutes of complete quiet: GPU pagination
+# pages 1..12 returned HTTP 200 at production's 2.5s cadence; request 13
+# returned HTTP 429. This is stricter than the older one-off 129-page probe
+# and must cap every network contact in a cycle, including category refreshes
+# and transport retries.
+MEASURED_SAFE_CONTACTS_PER_CYCLE = 12
 # proshop.timer fires every 15 minutes.
 TIMER_PERIOD_S = 15 * 60
 TIMER_PERIOD_H = TIMER_PERIOD_S / 3600
@@ -52,8 +46,12 @@ TIMER_BUDGET_SHARE = 0.75
 # Listing queue size, measured 2026-09-21. NOT the 35,858-row
 # `proshop-products` store: the cycle walks listing pages.
 MEASURED_LISTING_PAGES = 1489
-# One lap per working day. The previous 20-page runtime took 18.6h.
-TARGET_LAP_HOURS = 12.0
+# Current live pagination: 15 GPU pages + 53 RAM pages. These are the user's
+# highest-value categories and keep an explicit fast-lap guarantee even when
+# the shop's hard burst threshold forces the broad catalogue to run slowly.
+MEASURED_FOCUS_PAGES = 68
+TARGET_FOCUS_LAP_HOURS = 4.0
+TARGET_GENERAL_LAP_HOURS = 72.0
 
 
 def hourly_rate(pages: int, period_h: float = TIMER_PERIOD_H) -> float:
@@ -68,9 +66,9 @@ def assert_within_envelope(pages: int, delay_s: float, origin: str) -> None:
         f"{MEASURED_REFUSED_MIN_PER_HOUR}/h and the highest served was "
         f"{MEASURED_SERVED_MAX_PER_HOUR}/h"
     )
-    assert pages <= MEASURED_SAFE_BURST, (
-        f"{origin}: a {pages}-page burst exceeds the longest refusal-free "
-        f"run measured ({MEASURED_SAFE_BURST})"
+    assert pages <= MEASURED_SAFE_CONTACTS_PER_CYCLE, (
+        f"{origin}: a {pages}-page burst would send the measured-refused "
+        f"contact 13 (safe contacts: {MEASURED_SAFE_CONTACTS_PER_CYCLE})"
     )
     duration = pages * delay_s
     assert duration <= TIMER_PERIOD_S * TIMER_BUDGET_SHARE, (
@@ -93,6 +91,14 @@ def test_the_shipped_defaults_stay_within_the_hourly_allowance():
     settings = _defaults()
     assert_within_envelope(
         settings.pages_per_pass, settings.request_delay_s, "code defaults"
+    )
+
+
+def test_the_shipped_pass_stays_below_the_measured_burst_threshold():
+    settings = _defaults()
+    assert settings.pages_per_pass <= MEASURED_SAFE_CONTACTS_PER_CYCLE, (
+        f"the shop served 12 consecutive contacts and refused contact 13, "
+        f"but the shipped pass still asks for {settings.pages_per_pass} pages"
     )
 
 
@@ -120,30 +126,42 @@ def test_focus_keeps_its_reserved_share():
     assert round(settings.pages_per_pass * settings.focus_share) >= 1
 
 
-def test_the_budget_still_laps_the_catalogue_often_enough():
-    """Safety is only half the rule: a safe pass can be uselessly small.
-
-    20 pages at 2.0s sat well inside every safety bound and was exactly what
-    production ran, lapping the 1,489-page listing queue once every ~18.6h.
-    """
+def test_focus_budget_laps_gpu_and_ram_within_four_hours():
+    """The burst guard must not make the highest-value categories stale."""
     settings = _defaults()
-    pages_per_day = settings.pages_per_pass * (24 / TIMER_PERIOD_H)
-    lap_hours = 24 * MEASURED_LISTING_PAGES / pages_per_day
-    assert lap_hours <= TARGET_LAP_HOURS, (
-        f"a {settings.pages_per_pass}-page pass laps the "
-        f"{MEASURED_LISTING_PAGES}-page listing queue every {lap_hours:.1f}h, "
-        f"past the {TARGET_LAP_HOURS}h target"
+    focus_per_pass = round(settings.pages_per_pass * settings.focus_share)
+    focus_per_hour = focus_per_pass / TIMER_PERIOD_H
+    lap_hours = MEASURED_FOCUS_PAGES / focus_per_hour
+    assert lap_hours <= TARGET_FOCUS_LAP_HOURS, (
+        f"GPU+RAM would lap every {lap_hours:.1f}h, past the "
+        f"{TARGET_FOCUS_LAP_HOURS}h target"
+    )
+
+
+def test_general_budget_still_laps_the_catalogue_within_three_days():
+    """Safety may slow the tail, but must not silently starve it."""
+    settings = _defaults()
+    general_per_pass = settings.pages_per_pass - round(
+        settings.pages_per_pass * settings.focus_share
+    )
+    general_per_hour = general_per_pass / TIMER_PERIOD_H
+    general_pages = MEASURED_LISTING_PAGES - MEASURED_FOCUS_PAGES
+    lap_hours = general_pages / general_per_hour
+    assert lap_hours <= TARGET_GENERAL_LAP_HOURS, (
+        f"the general catalogue would lap every {lap_hours:.1f}h, past the "
+        f"{TARGET_GENERAL_LAP_HOURS}h starvation guard"
     )
 
 
 @pytest.mark.parametrize(
     ("pages", "delay", "allowed"),
     [
-        (40, 2.5, True),  # deployed: 160/h
+        (12, 2.5, True),  # measured: contact 13 refused
+        (40, 2.5, False),  # hourly-safe, but crosses the burst threshold
         (120, 2.5, False),  # 480/h - deployed on burst evidence, refused live
         (100, 2.5, False),  # 400/h
         (60, 2.5, False),  # 240/h - still above the refusal band
-        (20, 2.0, True),  # 80/h - safe, but see the lap test above
+        (20, 2.0, False),  # hourly-safe, but contact 13 was refused live
     ],
 )
 def test_the_envelope_rejects_rates_the_shop_refused(

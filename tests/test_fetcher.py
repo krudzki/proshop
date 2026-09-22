@@ -111,6 +111,55 @@ async def test_short_challenge_shell_is_a_refusal_even_with_200():
     assert fetcher.refused_url == "https://www.proshop.pl/RAM"
 
 
+async def test_contact_budget_stops_before_the_measured_thirteenth_request():
+    """Retries and refreshes share one hard network-contact budget.
+
+    Live on 2026-09-22, contacts 1..12 returned 200 and contact 13 returned
+    429. The transport boundary is the only place that can count every real
+    contact, including retries; a page-loop limit cannot do that.
+    """
+    session = FakeSession([Response(200, "ok")] * 13)
+    fetcher = CurlCffiFetcher(
+        0,
+        session=session,
+        sleeper=_no_sleep,
+        max_requests=12,
+    )
+
+    statuses = []
+    for page in range(1, 14):
+        status, _ = await fetcher(f"https://www.proshop.pl/RAM?pn={page}")
+        statuses.append(status)
+
+    assert statuses[:12] == [200] * 12
+    assert statuses[12] == 0
+    assert len(session.calls) == 12, "the measured-refused 13th contact was sent"
+    assert fetcher.requests_made == 12
+    assert fetcher.remaining_requests == 0
+    assert fetcher.budget_exhausted is True
+    assert fetcher.shop_refusal is False, "a local safety stop was blamed on the shop"
+
+
+async def test_contact_budget_does_not_erase_a_real_cold_refusal():
+    """A denied final contact remains a denial when no retry budget remains."""
+    session = FakeSession([Response(429, "Too Many Requests")])
+    fetcher = CurlCffiFetcher(
+        0,
+        session=session,
+        sleeper=_no_sleep,
+        cold_retry_wait_s=0,
+        max_requests=1,
+    )
+
+    status, _ = await fetcher("https://www.proshop.pl/RAM")
+
+    assert status == 429
+    assert len(session.calls) == 1
+    assert fetcher.budget_exhausted is True
+    assert fetcher.shop_refusal is True
+    assert fetcher.refused_url == "https://www.proshop.pl/RAM"
+
+
 
 
 def test_close_releases_the_coherent_session():
