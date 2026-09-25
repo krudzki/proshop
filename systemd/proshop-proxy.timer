@@ -1,27 +1,26 @@
 [Unit]
 Description=Proshop proxy scan every 15 minutes (B)
-# PARKED 2026-09-21. This timer is intentionally left in the repository and
-# disabled rather than deleted, so the lane can return with one
-# `systemctl --user enable --now proshop-proxy.timer`.
+# Re-enabled 2026-09-25 after being parked 2026-09-21. The reasons for parking
+# no longer hold, measured rather than assumed:
 #
-# Why it was parked, measured rather than assumed:
+#   * The proxy works again. The 2026-09-21 cycles showed products_seen=0 and
+#     listing_fetch_errors=40 because the DataImpulse account was exhausted.
+#     On 2026-09-25 a fresh PL session served proshop.pl with HTTP 200.
+#   * The plain lane can no longer keep the catalogue fresh alone. Since
+#     2026-09-22 every cycle is capped at 12 contacts: the shop returns 429 on
+#     the 13th request in a burst from one address. Over the last 24 h the plain
+#     lane fetched 8-12 listing pages per cycle across 81 cycles, which is about
+#     1,000 pages a day against 2,480 listing pages. That is a lap of roughly
+#     2.5 days.
 #
-#   * It buys no COVERAGE. Both units run `python -m proshop.scanner` against
-#     one queue - `strony` filtered by `sklep`, ordered by least-recently
-#     checked (proshop/queue.py). There is no separate cursor, so the proxy
-#     lane only ever added throughput to the same lap. Parking it cannot
-#     shrink the scanned scope.
-#   * It was producing nothing. Every cycle for days: products_seen=0,
-#     listing_fetch_errors=40, reported=0 - the dead-proxy shape, because the
-#     DataImpulse account is exhausted. The plain lane meanwhile served
-#     425-463 products a cycle with fetch_errors 0-1.
-#   * The shop does not require a proxy from this box. 48 consecutive listing
-#     pages were served direct before Cloudflare appeared, so the residential
-#     exit is not what makes Proshop reachable.
+# Both lanes run `python -m proshop.scanner` against the same least-recently-
+# checked queue, so the proxy lane adds throughput and does not duplicate a
+# cursor. The burst limit applies per address and this lane draws a fresh
+# residential identity every cycle. The scanner's hourly guard (160 listing
+# pages) is shared by both lanes because they record cycles under one store.
 #
-# Re-enable it only if a measurement shows the plain lane cannot keep the
-# catalogue fresh on its own; if the proxy account is topped up, prefer
-# spending that bandwidth on shops that genuinely refuse a direct request.
+# To park it again: disable the timer AND remove its line from
+# serwer-minipc/systemd/enabled.txt, or the fleet installer re-enables it.
 
 [Timer]
 OnBootSec=12min
